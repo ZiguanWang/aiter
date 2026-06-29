@@ -807,7 +807,15 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     split_max = (cu_num + tg_num - 1) // tg_num
     # at least split = 2
     for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
+        # Require KBatch = (model_dim / split) / tilek >= 2.
+        # When KBatch == 1 the CK kernel still uses atomic-add but skips the
+        # output memset, so results accumulate onto uninitialized memory
+        # (e.g. K=4096, split=16 -> KBatch=1 -> bs=1 MoE gibberish).
+        if (
+            (model_dim % i == 0)
+            and ((model_dim // i) % tilek == 0)
+            and ((model_dim // i) // tilek >= 2)
+        ):
             return i
     return 0
 
@@ -2471,7 +2479,14 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
-    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
+    # Only enable split-k when each K partition owns >= 2 k-tiles
+    # (KBatch = K / (splitk * KPerBlock), KPerBlock == 256). When KBatch == 1 the
+    # CK kernel uses atomic-add but skips the output memset, accumulating onto
+    # uninitialized memory -> gibberish. This guards splitk from CSV / AITER_KSPLIT
+    # that bypass get_ksplit's KBatch >= 2 check.
+    KPerBlock = 256
+    k_batch = (hidden_states.shape[1] // splitk) // KPerBlock if splitk > 1 else 1
+    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1 and k_batch >= 2
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
